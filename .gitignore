@@ -1,0 +1,18 @@
+# Build outputs
+build/
+*.o
+*.dSYM
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Logs
+*.log
+
+# Editor & IDE files
+.vscode/
+.idea/
+*.swp
+*~

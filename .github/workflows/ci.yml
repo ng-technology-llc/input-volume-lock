@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build-and-test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build binary
+        run: |
+          mkdir -p build
+          xcrun swiftc \
+            -O \
+            -framework AudioToolbox \
+            -framework CoreAudio \
+            src/InputVolumeLock.swift \
+            -o build/input-volume-lock
+
+      - name: Run unit & self tests
+        run: |
+          build/input-volume-lock --self-test
