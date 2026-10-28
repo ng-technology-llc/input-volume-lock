@@ -133,25 +133,156 @@ private func inputDevices() -> [AudioDeviceID] {
     allDevices().filter { inputChannelCount($0) > 0 }
 }
 
-private let arguments = Array(CommandLine.arguments.dropFirst())
-guard arguments.count == 1 else {
-    fputs("usage: audio-device-test-helper {list|current|builtin|nonbuiltin}\n", stderr)
+private func settableInputElements(_ device: AudioDeviceID) -> [AudioObjectPropertyElement] {
+    guard inputChannelCount(device) > 0 else { return [] }
+    var candidates: [AudioObjectPropertyElement] = [kAudioObjectPropertyElementMain]
+    let channels = inputChannelCount(device)
+    if channels > 0 {
+        candidates.append(contentsOf: (1...channels).map(AudioObjectPropertyElement.init))
+    }
+    var supported: [AudioObjectPropertyElement] = []
+    for element in candidates where !supported.contains(element) {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: kAudioObjectPropertyScopeInput,
+            mElement: element
+        )
+        var settable = DarwinBoolean(false)
+        guard AudioObjectHasProperty(device, &address),
+              AudioObjectIsPropertySettable(device, &address, &settable) == noErr,
+              settable.boolValue else {
+            continue
+        }
+        supported.append(element)
+    }
+    return supported
+}
+
+private func readScalar(
+    _ device: AudioDeviceID,
+    element: AudioObjectPropertyElement
+) -> Float32? {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyVolumeScalar,
+        mScope: kAudioObjectPropertyScopeInput,
+        mElement: element
+    )
+    var volume: Float32 = 0
+    var size = UInt32(MemoryLayout<Float32>.size)
+    let status = AudioObjectGetPropertyData(device, &address, 0, nil, &size, &volume)
+    return status == noErr ? volume : nil
+}
+
+private func writeScalar(
+    _ device: AudioDeviceID,
+    element: AudioObjectPropertyElement,
+    value: Float32
+) -> OSStatus {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyVolumeScalar,
+        mScope: kAudioObjectPropertyScopeInput,
+        mElement: element
+    )
+    var newValue = value
+    return AudioObjectSetPropertyData(
+        device,
+        &address,
+        0,
+        nil,
+        UInt32(MemoryLayout<Float32>.size),
+        &newValue
+    )
+}
+
+private func usage() -> Never {
+    fputs(
+        "usage: audio-device-test-helper {list|current|builtin|nonbuiltin|scalar|set-scalar PERCENT|select ID|other-lockable|other-unlockable}\n",
+        stderr
+    )
     exit(64)
 }
 
+private let arguments = Array(CommandLine.arguments.dropFirst())
+guard !arguments.isEmpty else { usage() }
+
 switch arguments[0] {
-case "list":
+case "list" where arguments.count == 1:
     for device in inputDevices() {
         let kind = isBuiltInInput(device) ? "builtin" : "external"
         print("\(device)\t\(kind)\t\(deviceName(device))")
     }
-case "current":
+case "current" where arguments.count == 1:
     guard let device = defaultInputDevice() else {
         fputs("no default input device\n", stderr)
         exit(2)
     }
     print("\(device)\t\(deviceName(device))")
-case "builtin":
+case "scalar" where arguments.count == 1:
+    guard let device = defaultInputDevice() else {
+        fputs("no default input device\n", stderr)
+        exit(2)
+    }
+    let values = settableInputElements(device).compactMap { readScalar(device, element: $0) }
+    guard let lowest = values.min() else {
+        fputs("none\n", stderr)
+        exit(3)
+    }
+    print(Int((lowest * 100).rounded()))
+case "set-scalar" where arguments.count == 2:
+    guard let percent = Int(arguments[1]), (0...100).contains(percent) else {
+        fputs("percent must be 0...100\n", stderr)
+        exit(64)
+    }
+    guard let device = defaultInputDevice() else {
+        fputs("no default input device\n", stderr)
+        exit(2)
+    }
+    let elements = settableInputElements(device)
+    guard !elements.isEmpty else {
+        fputs("no settable input volume\n", stderr)
+        exit(3)
+    }
+    let value = Float32(percent) / 100
+    for element in elements where writeScalar(device, element: element, value: value) != noErr {
+        fputs("failed to write input volume\n", stderr)
+        exit(5)
+    }
+    print(percent)
+case "select" where arguments.count == 2:
+    guard let id = UInt32(arguments[1]) else {
+        fputs("device id must be an integer\n", stderr)
+        exit(64)
+    }
+    guard setDefaultInputDevice(id) else {
+        fputs("failed to select input device\n", stderr)
+        exit(4)
+    }
+    print("\(id)\t\(deviceName(id))")
+case "other-lockable" where arguments.count == 1:
+    guard let current = defaultInputDevice() else {
+        fputs("no default input device\n", stderr)
+        exit(2)
+    }
+    guard let device = inputDevices().first(where: {
+        $0 != current && !settableInputElements($0).isEmpty
+    }) else {
+        fputs("no other input with a settable volume\n", stderr)
+        exit(3)
+    }
+    print("\(device)\t\(deviceName(device))")
+case "other-unlockable" where arguments.count == 1:
+    guard let current = defaultInputDevice() else {
+        fputs("no default input device\n", stderr)
+        exit(2)
+    }
+    guard let device = inputDevices().first(where: {
+        $0 != current && settableInputElements($0).isEmpty
+    }) else {
+        fputs("no other input without a settable volume\n", stderr)
+        exit(3)
+    }
+    print("\(device)\t\(deviceName(device))")
+case "builtin" where arguments.count == 1:
     guard let device = inputDevices().first(where: isBuiltInInput) else {
         fputs("no built-in input device found\n", stderr)
         exit(3)
@@ -161,7 +292,7 @@ case "builtin":
         exit(4)
     }
     print("\(device)\t\(deviceName(device))")
-case "nonbuiltin":
+case "nonbuiltin" where arguments.count == 1:
     guard let device = inputDevices().first(where: { !isBuiltInInput($0) }) else {
         fputs("no non-built-in input device found\n", stderr)
         exit(3)
@@ -172,6 +303,5 @@ case "nonbuiltin":
     }
     print("\(device)\t\(deviceName(device))")
 default:
-    fputs("unknown command\n", stderr)
-    exit(64)
+    usage()
 }

@@ -11,10 +11,11 @@ readonly DEVICE_HELPER="$SCRIPT_DIR/build/audio-device-test-helper"
 readonly WITH_DEVICE_SWITCH="${1:-}"
 
 failures=0
+original_device=""
 
 cleanup() {
-    if [[ -x "$DEVICE_HELPER" ]]; then
-        "$DEVICE_HELPER" builtin >/dev/null 2>&1 || true
+    if [[ -n "$original_device" && -x "$DEVICE_HELPER" ]]; then
+        "$DEVICE_HELPER" select "$original_device" >/dev/null 2>&1 || true
     fi
     "$SCRIPT_DIR/install.sh" resume >/dev/null 2>&1 || true
 }
@@ -30,8 +31,7 @@ fail() {
 }
 
 current_volume() {
-    osascript -e 'get volume settings' |
-        sed -E 's/.*input volume:([0-9]+).*/\1/'
+    "$DEVICE_HELPER" scalar
 }
 
 assert_volume() {
@@ -77,12 +77,12 @@ log_entries_since_test() {
 echo "Running input-volume-lock regression tests"
 log_size="$(stat -f %z "$LOG" 2>/dev/null || echo 0)"
 log_offset=$((log_size + 1))
-mkdir -p "$SCRIPT_DIR/build"
 xcrun swiftc \
     -O \
     -framework CoreAudio \
     "$SCRIPT_DIR/tests/AudioDeviceTestHelper.swift" \
     -o "$DEVICE_HELPER"
+original_device="$("$DEVICE_HELPER" current | cut -f1)"
 "$SCRIPT_DIR/install.sh" install
 "$BUILT_BIN" --self-test
 pass "self-test ran after the current binary was built and installed"
@@ -95,32 +95,55 @@ else
     fail "installed binary differs from the current build"
 fi
 
+correction_log_offset=$(( $(stat -f %z "$LOG") + 1 ))
+log_offset="$correction_log_offset"
+
 echo "Test: event-driven correction from 37%"
-osascript -e 'set volume input volume 37'
+"$DEVICE_HELPER" set-scalar 37
 wait_for_volume 100 2
 
 echo "Test: event-driven correction from 0%"
-osascript -e 'set volume input volume 0'
+"$DEVICE_HELPER" set-scalar 0
 wait_for_volume 100 2
 
 if [[ "$WITH_DEVICE_SWITCH" == "--with-device-switch" ]]; then
     echo "Test: default input device switch and reattachment"
-    if external_device="$("$DEVICE_HELPER" nonbuiltin)"; then
-        pass "switched temporarily to non-built-in input: $external_device"
+    if other_device="$("$DEVICE_HELPER" other-lockable)"; then
+        other_id="${other_device%%$'\t'*}"
+        other_name="${other_device#*$'\t'}"
+        pass "other lockable input is available: $other_name"
+        log_offset=$(( $(stat -f %z "$LOG") + 1 ))
+        "$DEVICE_HELPER" select "$other_id"
         sleep 0.5
         new_entries="$(log_entries_since_test)"
-        if grep -Fq 'default input is not built-in' <<<"$new_entries"; then
-            pass "guard skipped the non-built-in input"
+        if grep -Fq "watching active input: $other_name" <<<"$new_entries"; then
+            pass "guard followed $other_name"
+            "$DEVICE_HELPER" set-scalar 41
+            wait_for_volume 100 2
         else
-            fail "guard did not log skipping the non-built-in input"
+            fail "guard did not follow $other_name"
         fi
-        "$DEVICE_HELPER" builtin
+    elif other_device="$("$DEVICE_HELPER" other-unlockable)"; then
+        other_id="${other_device%%$'\t'*}"
+        other_name="${other_device#*$'\t'}"
+        pass "other input without volume is available: $other_name"
+        log_offset=$(( $(stat -f %z "$LOG") + 1 ))
+        "$DEVICE_HELPER" select "$other_id"
         sleep 0.5
-        osascript -e 'set volume input volume 41'
-        wait_for_volume 100 2
+        new_entries="$(log_entries_since_test)"
+        if grep -Fq "skip: active input has no settable volume: $other_name" <<<"$new_entries"; then
+            pass "guard skipped $other_name"
+        else
+            fail "guard did not skip $other_name"
+        fi
     else
-        fail "no non-built-in input was available for the switch test"
+        fail "no other input device was available for the switch test"
     fi
+    "$DEVICE_HELPER" select "$original_device"
+    sleep 0.5
+    "$DEVICE_HELPER" set-scalar 41
+    wait_for_volume 100 2
+    log_offset="$correction_log_offset"
 fi
 
 echo "Test: pause honors manual lower volume"
@@ -130,7 +153,7 @@ if launchctl print "$DOMAIN/$APP_ID" >/dev/null 2>&1; then
 else
     pass "pause unloads the LaunchAgent"
 fi
-osascript -e 'set volume input volume 33'
+"$DEVICE_HELPER" set-scalar 33
 sleep 6
 assert_volume 33
 
@@ -141,7 +164,7 @@ wait_for_volume 100 3
 echo "Test: service restart keeps enforcing"
 launchctl kickstart -k "$DOMAIN/$APP_ID"
 sleep 0.5
-osascript -e 'set volume input volume 45'
+"$DEVICE_HELPER" set-scalar 45
 wait_for_volume 100 2
 
 new_entries="$(log_entries_since_test)"

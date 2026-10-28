@@ -42,7 +42,17 @@ install_service() {
     mv -f "$temporary_plist" "$PLIST"
     chmod 644 "$PLIST"
 
+    local once_status=0
+    set +e
     "$INSTALLED_BIN" --once
+    once_status=$?
+    set -e
+    if [[ "$once_status" -eq 4 ]]; then
+        echo "warning: active input has no settable volume; the service will keep watching, but nothing is locked right now" >&2
+    elif [[ "$once_status" -ne 0 ]]; then
+        echo "error: input-volume-lock --once failed with status $once_status" >&2
+        exit "$once_status"
+    fi
     stop_service
     launchctl enable "$DOMAIN/$APP_ID"
     launchctl bootstrap "$DOMAIN" "$PLIST"

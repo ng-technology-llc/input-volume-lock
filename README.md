@@ -20,7 +20,7 @@
 **`input-volume-lock`** 是一个专为 macOS 设计的轻量级原生音频守护工具：
 * **零 CPU 占用**：使用 macOS 原生 `CoreAudio` 事件驱动监听（`AudioObjectAddPropertyListenerBlock`），不是高耗电的轮询脚本。
 * **毫秒级极速拉回**：一旦有任何软件或系统算法把麦克风输入音量下调，立即在毫秒内拉回到 **100%**。
-* **智能识别内建设备**：默认只锁定 Mac 自带的内建麦克风（`kAudioDeviceTransportTypeBuiltIn`），不会干扰专业外接声卡或 USB 耳麦。
+* **跟随当前输入设备**：锁定系统设置里当前选中的那一只输入。换成 USB 麦克风、蓝牙耳机或其他外接设备后，锁定会跟着过去。没有音量旋钮的设备会跳过，不会去改其他设备。
 * **静默开机自启**：配置为系统标准的 `LaunchAgent`，开机即在后台静默护航。
 
 ---
@@ -34,7 +34,7 @@
 | **实测通过机型** | • **MacBook Pro 16" (M1 Pro, Model identifier: `MacBookPro18,1`)**<br>• **MacBook Pro (Apple Silicon M5, Darwin 27.x / Kernel arm64 T6050)** |
 | **理论全面兼容机型** | • **MacBook Pro** 全系列（Apple Silicon M1 / M2 / M3 / M4 / M5 及 Intel 架构机型）<br>• **MacBook Air** 全系列（M1 / M2 / M3 及 Intel 机型）<br>• **Mac mini / Mac Studio / iMac / Mac Pro** |
 | **macOS 系统版本** | macOS Monterey (12.x)、macOS Ventura (13.x)、macOS Sonoma (14.x)、macOS Sequoia (15.x) 及更高版本 |
-| **音频通道要求** | 支持任意搭载内建麦克风（Built-in Microphone）的 Mac 设备 |
+| **音频通道要求** | 当前选中的输入设备需要提供可调节的输入音量。没有音量控件的设备会被跳过 |
 
 ---
 
@@ -96,8 +96,8 @@ When using meeting apps on Mac (**Zoom, Microsoft Teams, Google Meet, WeChat, Te
 
 ### Features
 * **Zero CPU / Battery Overhead**: Leverages native macOS `CoreAudio` event listener callbacks (`AudioObjectAddPropertyListenerBlock`) instead of polling.
-* **Instant Millisecond Restoration**: Restores built-in input volume to 100% the moment any software pulls it down.
-* **Smart Device Filter**: Only locks the Mac's built-in microphone (`kAudioDeviceTransportTypeBuiltIn`). External USB audio interfaces and wireless headsets are ignored by default.
+* **Instant Millisecond Restoration**: Restores the active input volume to 100% the moment any software pulls it down.
+* **Follows the selected input**: Locks whichever device is chosen as the system input. Switching to a USB microphone, headset, or other input follows that device. A device with no input volume control is skipped.
 * **Clean LaunchAgent**: Runs natively as a standard user-space daemon across reboots.
 
 ### Hardware & Model Compatibility

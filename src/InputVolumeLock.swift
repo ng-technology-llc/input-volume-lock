@@ -99,18 +99,6 @@ private func inputChannelCount(_ device: AudioDeviceID) -> Int {
     return buffers.reduce(0) { $0 + Int($1.mNumberChannels) }
 }
 
-private func transportType(_ device: AudioDeviceID) -> UInt32? {
-    var address = AudioObjectPropertyAddress(
-        mSelector: kAudioDevicePropertyTransportType,
-        mScope: kAudioObjectPropertyScopeGlobal,
-        mElement: kAudioObjectPropertyElementMain
-    )
-    var transport: UInt32 = 0
-    var size = UInt32(MemoryLayout<UInt32>.size)
-    let status = AudioObjectGetPropertyData(device, &address, 0, nil, &size, &transport)
-    return status == noErr ? transport : nil
-}
-
 private func volumeElements(_ device: AudioDeviceID) -> [AudioObjectPropertyElement] {
     var candidates: [AudioObjectPropertyElement] = [kAudioObjectPropertyElementMain]
     let channels = inputChannelCount(device)
@@ -169,9 +157,66 @@ private func writeVolume(
     )
 }
 
-private func isBuiltInInput(_ device: AudioDeviceID) -> Bool {
-    inputChannelCount(device) > 0 &&
-        transportType(device) == kAudioDeviceTransportTypeBuiltIn
+private func lockableElements(_ device: AudioDeviceID) -> [AudioObjectPropertyElement] {
+    guard inputChannelCount(device) > 0 else { return [] }
+    return volumeElements(device)
+}
+
+private struct VolumeRestoreLog {
+    private enum Outcome {
+        case success
+        case failure
+    }
+
+    private var lastOutcome: Outcome?
+    private var lastSuccessLog: Date?
+    private var lastFailureLog: Date?
+    private(set) var suppressedSuccesses = 0
+
+    mutating func recordSuccess(now: Date) -> Int? {
+        let successDue: Bool
+        if let lastSuccessLog {
+            successDue = now.timeIntervalSince(lastSuccessLog) >= correctionLogInterval
+        } else {
+            successDue = true
+        }
+        let immediate = lastOutcome == .failure || successDue
+        lastOutcome = .success
+        guard immediate else {
+            suppressedSuccesses += 1
+            return nil
+        }
+        let suppressed = suppressedSuccesses
+        suppressedSuccesses = 0
+        lastSuccessLog = now
+        lastFailureLog = nil
+        return suppressed
+    }
+
+    mutating func recordFailure(now: Date) -> Bool {
+        let failureDue: Bool
+        if let lastFailureLog {
+            failureDue = now.timeIntervalSince(lastFailureLog) >= warningInterval
+        } else {
+            failureDue = true
+        }
+        let immediate = lastOutcome == .success || failureDue
+        lastOutcome = .failure
+        guard immediate else { return false }
+        lastFailureLog = now
+        return true
+    }
+
+    mutating func flush(now: Date) -> Int? {
+        guard suppressedSuccesses > 0, let lastSuccessLog,
+              now.timeIntervalSince(lastSuccessLog) >= correctionLogInterval else {
+            return nil
+        }
+        let count = suppressedSuccesses
+        suppressedSuccesses = 0
+        self.lastSuccessLog = now
+        return count
+    }
 }
 
 private final class InputVolumeGuard {
@@ -184,9 +229,7 @@ private final class InputVolumeGuard {
     private var lastIneligibleDevice: AudioDeviceID = kAudioObjectUnknown
     private var lastNoDeviceWarning: Date?
     private var lastReadWarning: Date?
-    private var lastRestoreWarning: Date?
-    private var lastCorrectionLog: Date?
-    private var suppressedCorrections = 0
+    private var restoreLog = VolumeRestoreLog()
 
     func start() {
         queue.async {
@@ -203,10 +246,7 @@ private final class InputVolumeGuard {
             mElement: kAudioObjectPropertyElementMain
         )
         let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            self?.queue.async {
-                self?.attachToDefaultDeviceIfNeeded()
-                self?.enforce()
-            }
+            self?.queue.async { self?.enforce() }
         }
         let status = AudioObjectAddPropertyListenerBlock(
             AudioObjectID(kAudioObjectSystemObject),
@@ -221,17 +261,27 @@ private final class InputVolumeGuard {
         }
     }
 
-    private func attachToDefaultDeviceIfNeeded() {
-        guard let device = defaultInputDevice(), device != currentDevice else {
-            return
+    private func clearCurrentDevice() {
+        removeDeviceListeners()
+        currentDevice = AudioDeviceID(kAudioObjectUnknown)
+        lastIneligibleDevice = AudioDeviceID(kAudioObjectUnknown)
+        restoreLog = VolumeRestoreLog()
+    }
+
+    private func ensureWatching(
+        _ device: AudioDeviceID,
+        elements: [AudioObjectPropertyElement]
+    ) {
+        if device != currentDevice {
+            removeDeviceListeners()
+            currentDevice = device
+            lastIneligibleDevice = AudioDeviceID(kAudioObjectUnknown)
+            restoreLog = VolumeRestoreLog()
         }
 
-        removeDeviceListeners()
-        currentDevice = device
+        guard deviceListeners.isEmpty, !elements.isEmpty else { return }
 
-        guard isBuiltInInput(device) else { return }
-
-        for element in volumeElements(device) {
+        for element in elements {
             var address = inputVolumeAddress(element: element)
             let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
                 self?.queue.async { self?.enforce() }
@@ -246,7 +296,8 @@ private final class InputVolumeGuard {
                 deviceListeners.append((address, listener))
             }
         }
-        log("watching built-in input: \(deviceName(device))")
+        guard !deviceListeners.isEmpty else { return }
+        log("watching active input: \(deviceName(device))")
     }
 
     private func removeDeviceListeners() {
@@ -274,9 +325,8 @@ private final class InputVolumeGuard {
             leeway: .seconds(1)
         )
         timer.setEventHandler { [weak self] in
-            self?.flushSuppressedCorrectionsIfDue()
-            self?.attachToDefaultDeviceIfNeeded()
             self?.enforce()
+            self?.flushSuppressedCorrectionsIfDue()
         }
         timer.resume()
         heartbeat = timer
@@ -292,38 +342,30 @@ private final class InputVolumeGuard {
         lastLogged = now
     }
 
-    private func logCorrection(_ message: String) {
-        let now = Date()
-        if let lastCorrectionLog,
-           now.timeIntervalSince(lastCorrectionLog) < correctionLogInterval {
-            suppressedCorrections += 1
-            return
-        }
-
-        let suffix = suppressedCorrections > 0
-            ? " (\(suppressedCorrections) similar corrections suppressed)"
+    private func logRestore(_ message: String) {
+        guard let suppressed = restoreLog.recordSuccess(now: Date()) else { return }
+        let suffix = suppressed > 0
+            ? " (\(suppressed) similar corrections suppressed)"
             : ""
         log(message + suffix)
-        lastCorrectionLog = now
-        suppressedCorrections = 0
+    }
+
+    private func logRestoreFailure(_ message: String) {
+        guard restoreLog.recordFailure(now: Date()) else { return }
+        log(message)
     }
 
     private func flushSuppressedCorrectionsIfDue() {
-        guard suppressedCorrections > 0,
-              let lastCorrectionLog,
-              Date().timeIntervalSince(lastCorrectionLog) >= correctionLogInterval else {
-            return
-        }
+        guard let suppressed = restoreLog.flush(now: Date()) else { return }
         log(
-            "summary: \(suppressedCorrections)"
+            "summary: \(suppressed)"
                 + " repeated input volume correction(s) were suppressed"
         )
-        self.lastCorrectionLog = Date()
-        suppressedCorrections = 0
     }
 
     private func enforce() {
         guard let device = defaultInputDevice() else {
+            clearCurrentDevice()
             rateLimitedWarning(
                 "warning: no default input device",
                 lastLogged: &lastNoDeviceWarning
@@ -332,20 +374,18 @@ private final class InputVolumeGuard {
         }
         lastNoDeviceWarning = nil
 
-        if device != currentDevice {
-            attachToDefaultDeviceIfNeeded()
-        }
+        let elements = lockableElements(device)
+        ensureWatching(device, elements: elements)
 
-        guard isBuiltInInput(device) else {
+        guard !elements.isEmpty else {
             if lastIneligibleDevice != device {
-                log("skip: default input is not built-in: \(deviceName(device))")
+                log("skip: active input has no settable volume: \(deviceName(device))")
                 lastIneligibleDevice = device
             }
             return
         }
         lastIneligibleDevice = kAudioObjectUnknown
 
-        let elements = volumeElements(device)
         let readings = elements.compactMap { element -> VolumeReading? in
             readVolume(device, element: element).map {
                 VolumeReading(element: element, value: $0)
@@ -353,7 +393,7 @@ private final class InputVolumeGuard {
         }
         guard !readings.isEmpty else {
             rateLimitedWarning(
-                "warning: could not read built-in input volume",
+                "warning: could not read active input volume",
                 lastLogged: &lastReadWarning
             )
             return
@@ -383,7 +423,7 @@ private final class InputVolumeGuard {
             afterReadings.count == readings.count &&
             remainingLow.isEmpty {
             let lowestBefore = lowReadings.map(\.value).min() ?? 0
-            logCorrection(
+            logRestore(
                 String(
                     format: "restored input volume %.1f%% -> %.1f%% on %@ (%d element(s) corrected)",
                     lowestBefore * 100,
@@ -396,14 +436,13 @@ private final class InputVolumeGuard {
             let remaining = remainingLow
                 .map { String(format: "%.1f%%", $0.value * 100) }
                 .joined(separator: ", ")
-            rateLimitedWarning(
+            logRestoreFailure(
                 String(
                     format: "warning: failed to restore %@; read-backs [%@]; write errors [%@]",
                     deviceName(device),
                     remaining.isEmpty ? "none low" : remaining,
                     failedStatuses.map(String.init).joined(separator: ", ")
-                ),
-                lastLogged: &lastRestoreWarning
+                )
             )
         }
     }
@@ -414,18 +453,18 @@ private func runFocusedOnce() -> Never {
         log("error: no default input device")
         exit(2)
     }
-    guard isBuiltInInput(device) else {
-        log("skip: default input is not built-in: \(deviceName(device))")
-        exit(0)
+    let elements = lockableElements(device)
+    guard !elements.isEmpty else {
+        log("skip: active input has no settable volume: \(deviceName(device))")
+        exit(4)
     }
-    let elements = volumeElements(device)
     let beforeReadings = elements.compactMap { element -> VolumeReading? in
         readVolume(device, element: element).map {
             VolumeReading(element: element, value: $0)
         }
     }
     guard !beforeReadings.isEmpty else {
-        log("error: could not read built-in input volume")
+        log("error: could not read active input volume")
         exit(3)
     }
 
@@ -509,6 +548,52 @@ private func runSelfTest() -> Never {
         "detects complete mute"
     )
 
+    let start = Date(timeIntervalSince1970: 0)
+    var repeated = VolumeRestoreLog()
+    expect(repeated.recordSuccess(now: start) == 0, "logs the first correction")
+    expect(
+        repeated.recordSuccess(now: start.addingTimeInterval(10)) == nil,
+        "suppresses a repeated correction inside 60s"
+    )
+    expect(
+        repeated.recordFailure(now: start.addingTimeInterval(20)),
+        "logs a failure immediately after a success"
+    )
+    expect(
+        repeated.recordSuccess(now: start.addingTimeInterval(21)) == 1,
+        "logs a success immediately after a failure and reports the suppressed count"
+    )
+
+    var failuresOnly = VolumeRestoreLog()
+    expect(failuresOnly.recordFailure(now: start), "logs the first failure")
+    expect(
+        !failuresOnly.recordFailure(now: start.addingTimeInterval(30)),
+        "suppresses a repeated failure inside 10 minutes"
+    )
+    expect(
+        failuresOnly.recordFailure(now: start.addingTimeInterval(601)),
+        "logs a failure again after 10 minutes"
+    )
+
+    var flushState = VolumeRestoreLog()
+    expect(flushState.recordSuccess(now: start) == 0, "flush fixture logs its first correction")
+    expect(
+        flushState.recordSuccess(now: start.addingTimeInterval(1)) == nil,
+        "flush fixture suppresses the next correction"
+    )
+    expect(
+        flushState.flush(now: start.addingTimeInterval(30)) == nil,
+        "does not flush suppressed corrections before 60s"
+    )
+    expect(
+        flushState.recordSuccess(now: start.addingTimeInterval(61)) == 1,
+        "a due correction reports suppressed events itself"
+    )
+    expect(
+        flushState.flush(now: start.addingTimeInterval(62)) == nil,
+        "flush after that correction does not hide it"
+    )
+
     if failures > 0 {
         print("\(failures) self-test(s) failed")
         exit(1)
@@ -548,5 +633,5 @@ if uniqueArguments.contains("--once") {
 
 private let guardService = InputVolumeGuard()
 guardService.start()
-log("input volume guard started; target=100%, built-in input only")
+log("input volume guard started; target=100%, active input device")
 dispatchMain()
